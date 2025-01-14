@@ -2,11 +2,12 @@
 #
 import re
 
-from django.shortcuts import reverse as dj_reverse
 from django.conf import settings
-from django.utils import timezone
 from django.db import models
 from django.db.models.signals import post_save, pre_save
+from django.shortcuts import reverse as dj_reverse
+from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 
 UUID_PATTERN = re.compile(r'[0-9a-zA-Z\-]{36}')
 
@@ -80,3 +81,26 @@ def bulk_create_with_signal(cls: models.Model, items, **kwargs):
     for i in items:
         post_save.send(sender=cls, instance=i, created=True)
     return result
+
+
+def get_request_os(request):
+    """获取请求的操作系统"""
+    agent = request.META.get('HTTP_USER_AGENT', '').lower()
+
+    if 'windows' in agent:
+        return 'windows'
+    elif 'mac' in agent:
+        return 'mac'
+    elif 'linux' in agent:
+        return 'linux'
+    else:
+        return 'unknown'
+
+
+def safe_next_url(next_url, request=None):
+    safe_hosts = [*settings.ALLOWED_HOSTS]
+    if request:
+        safe_hosts.append(request.get_host())
+    if not next_url or not url_has_allowed_host_and_scheme(next_url, safe_hosts):
+        next_url = '/'
+    return next_url

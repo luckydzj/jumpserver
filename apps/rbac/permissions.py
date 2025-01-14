@@ -16,7 +16,7 @@ class RBACPermission(permissions.DjangoModelPermissions):
         ('bulk_update', '%(app_label)s.change_%(model_name)s'),
         ('partial_bulk_update', '%(app_label)s.change_%(model_name)s'),
         ('bulk_destroy', '%(app_label)s.delete_%(model_name)s'),
-        ('render_to_json', '%(app_label)s.add_%(model_name)s'),
+        ('render_to_json', '*'),
         ('metadata', '*'),
         ('GET', '%(app_label)s.view_%(model_name)s'),
         ('OPTIONS', '*'),
@@ -92,9 +92,19 @@ class RBACPermission(permissions.DjangoModelPermissions):
 
         try:
             queryset = self._queryset(view)
-            model_cls = queryset.model
-        except:
+            if isinstance(queryset, list) and queryset:
+                model_cls = queryset[0].__class__
+            else:
+                model_cls = queryset.model
+        except AssertionError as e:
+            # logger.error(f'Error get model cls: {e}')
             model_cls = None
+        except AttributeError as e:
+            # logger.error(f'Error get model cls: {e}')
+            model_cls = None
+        except Exception as e:
+            # logger.error('Error get model class: {} of {}'.format(e, view))
+            raise e
         return model_cls
 
     def get_require_perms(self, request, view):
@@ -129,5 +139,8 @@ class RBACPermission(permissions.DjangoModelPermissions):
         if isinstance(perms, str):
             perms = [perms]
         has = request.user.has_perms(perms)
-        logger.debug('View require perms: {}, result: {}'.format(perms, has))
+        logger.debug('Api require perms: {}, result: {}'.format(perms, has))
         return has
+
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)

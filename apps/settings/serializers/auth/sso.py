@@ -1,4 +1,4 @@
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 __all__ = [
@@ -7,7 +7,10 @@ __all__ = [
 
 
 class SSOSettingSerializer(serializers.Serializer):
-    PREFIX_TITLE = '%s-%s' % (_('Authentication'), _('SSO'))
+    """
+    不对外开放了，只能通过配置文件修改，比较这个稍微有点危险
+    """
+    PREFIX_TITLE = _('SSO')
 
     AUTH_SSO = serializers.BooleanField(
         required=False, label=_('Enable SSO auth'),

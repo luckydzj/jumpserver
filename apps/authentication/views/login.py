@@ -2,31 +2,35 @@
 #
 
 from __future__ import unicode_literals
-import os
-import datetime
-from typing import Callable
 
-from django.templatetags.static import static
+import datetime
+import os
+from typing import Callable
+from urllib.parse import urlparse
+
+from django.conf import settings
+from django.contrib.auth import BACKEND_SESSION_KEY
 from django.contrib.auth import login as auth_login, logout as auth_logout
-from django.http import HttpResponse, HttpRequest
+from django.db import IntegrityError
+from django.http import HttpRequest
 from django.shortcuts import reverse, redirect
+from django.templatetags.static import static
+from django.urls import reverse_lazy
 from django.utils.decorators import method_decorator
-from django.utils.translation import ugettext as _, get_language
+from django.utils.translation import gettext as _, get_language
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.debug import sensitive_post_parameters
 from django.views.generic.base import TemplateView, RedirectView
 from django.views.generic.edit import FormView
-from django.conf import settings
-from django.urls import reverse_lazy
-from django.contrib.auth import BACKEND_SESSION_KEY
 
-from common.utils import FlashMessageUtil, static_or_direct
+from common.const import Language
+from common.utils import FlashMessageUtil, static_or_direct, safe_next_url
 from users.utils import (
     redirect_user_first_login_or_index
 )
-from ..const import RSA_PRIVATE_KEY, RSA_PUBLIC_KEY
 from .. import mixins, errors
+from ..const import RSA_PRIVATE_KEY, RSA_PUBLIC_KEY
 from ..forms import get_user_login_form_cls
 
 __all__ = [
@@ -38,54 +42,74 @@ __all__ = [
 class UserLoginContextMixin:
     get_user_mfa_context: Callable
     request: HttpRequest
+    error_origin: str
 
     def get_support_auth_methods(self):
+        query_string = self.request.GET.urlencode()
         auth_methods = [
             {
                 'name': 'OpenID',
                 'enabled': settings.AUTH_OPENID,
-                'url': reverse('authentication:openid:login'),
+                'url': f"{reverse('authentication:openid:login')}?{query_string}",
                 'logo': static('img/login_oidc_logo.png'),
                 'auto_redirect': True  # 是否支持自动重定向
             },
             {
                 'name': 'CAS',
                 'enabled': settings.AUTH_CAS,
-                'url': reverse('authentication:cas:cas-login'),
+                'url': f"{reverse('authentication:cas:cas-login')}?{query_string}",
                 'logo': static('img/login_cas_logo.png'),
                 'auto_redirect': True
             },
             {
                 'name': 'SAML2',
                 'enabled': settings.AUTH_SAML2,
-                'url': reverse('authentication:saml2:saml2-login'),
+                'url': f"{reverse('authentication:saml2:saml2-login')}?{query_string}",
                 'logo': static('img/login_saml2_logo.png'),
                 'auto_redirect': True
             },
             {
                 'name': settings.AUTH_OAUTH2_PROVIDER,
                 'enabled': settings.AUTH_OAUTH2,
-                'url': reverse('authentication:oauth2:login'),
+                'url': f"{reverse('authentication:oauth2:login')}?{query_string}",
                 'logo': static_or_direct(settings.AUTH_OAUTH2_LOGO_PATH),
                 'auto_redirect': True
             },
             {
                 'name': _('WeCom'),
                 'enabled': settings.AUTH_WECOM,
-                'url': reverse('authentication:wecom-qr-login'),
+                'url': f"{reverse('authentication:wecom-qr-login')}?{query_string}",
                 'logo': static('img/login_wecom_logo.png'),
             },
             {
                 'name': _('DingTalk'),
                 'enabled': settings.AUTH_DINGTALK,
-                'url': reverse('authentication:dingtalk-qr-login'),
+                'url': f"{reverse('authentication:dingtalk-qr-login')}?{query_string}",
                 'logo': static('img/login_dingtalk_logo.png')
             },
             {
                 'name': _('FeiShu'),
                 'enabled': settings.AUTH_FEISHU,
-                'url': reverse('authentication:feishu-qr-login'),
+                'url': f"{reverse('authentication:feishu-qr-login')}?{query_string}",
                 'logo': static('img/login_feishu_logo.png')
+            },
+            {
+                'name': 'Lark',
+                'enabled': settings.AUTH_LARK,
+                'url': f"{reverse('authentication:lark-qr-login')}?{query_string}",
+                'logo': static('img/login_lark_logo.png')
+            },
+            {
+                'name': _('Slack'),
+                'enabled': settings.AUTH_SLACK,
+                'url': f"{reverse('authentication:slack-qr-login')}?{query_string}",
+                'logo': static('img/login_slack_logo.png')
+            },
+            {
+                'name': _("Passkey"),
+                'enabled': settings.AUTH_PASSKEY,
+                'url': f"{reverse('api-auth:passkey-login')}?{query_string}",
+                'logo': static('img/login_passkey.png')
             }
         ]
         return [method for method in auth_methods if method['enabled']]
@@ -94,23 +118,17 @@ class UserLoginContextMixin:
     def get_support_langs():
         langs = [
             {
-                'title': '中文(简体)',
-                'code': 'zh-hans'
-            },
-            {
-                'title': 'English',
-                'code': 'en'
-            },
-            {
-                'title': '日本語',
-                'code': 'ja'
+                'title': title,
+                'code': code
             }
+            for code, title in Language.choices
         ]
         return langs
 
     def get_current_lang(self):
         langs = self.get_support_langs()
-        matched_lang = filter(lambda x: x['code'] == get_language(), langs)
+        lang = get_language()
+        matched_lang = filter(lambda x: x['code'] == lang, langs)
         return next(matched_lang, langs[0])
 
     @staticmethod
@@ -132,8 +150,27 @@ class UserLoginContextMixin:
             count += 1
         return count
 
+    def set_csrf_error_if_need(self, context):
+        if not self.request.GET.get('csrf_failure'):
+            return context
+
+        http_origin = self.request.META.get('HTTP_ORIGIN')
+        http_referer = self.request.META.get('HTTP_REFERER')
+        http_origin = http_origin or http_referer
+
+        if not http_origin:
+            return context
+
+        try:
+            origin = urlparse(http_origin)
+            context['error_origin'] = str(origin.netloc)
+        except ValueError:
+            pass
+        return context
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
+        self.set_csrf_error_if_need(context)
         context.update({
             'demo_mode': os.environ.get("DEMO_MODE"),
             'auth_methods': self.get_support_auth_methods(),
@@ -173,6 +210,7 @@ class UserLoginView(mixins.AuthMixin, UserLoginContextMixin, FormView):
 
         auth_name, redirect_url = auth_method['name'], auth_method['url']
         next_url = request.GET.get('next') or '/'
+        next_url = safe_next_url(next_url, request=request)
         query_string = request.GET.urlencode()
         redirect_url = '{}?next={}&{}'.format(redirect_url, next_url, query_string)
 
@@ -183,12 +221,16 @@ class UserLoginView(mixins.AuthMixin, UserLoginContextMixin, FormView):
                 'redirect_url': redirect_url,
                 'interval': 3,
                 'has_cancel': True,
-                'cancel_url': reverse('authentication:login') + '?admin=1'
+                'cancel_url': reverse('authentication:login') + f'?admin=1&{query_string}'
             }
             redirect_url = FlashMessageUtil.gen_message_url(message_data)
         return redirect_url
 
     def get(self, request, *args, **kwargs):
+        next_page = request.GET.get(self.redirect_field_name)
+        if next_page:
+            request.session[self.redirect_field_name] = next_page
+
         if request.user.is_staff:
             first_login_url = redirect_user_first_login_or_index(
                 request, self.redirect_field_name
@@ -202,7 +244,11 @@ class UserLoginView(mixins.AuthMixin, UserLoginContextMixin, FormView):
 
     def form_valid(self, form):
         if not self.request.session.test_cookie_worked():
-            return HttpResponse(_("Please enable cookies and try again."))
+            form.add_error(None, _("Login timeout, please try again."))
+            # 当 session 过期后，刷新浏览器重新提交依旧会报错，所以需要重新设置 test_cookie
+            self.request.session.set_test_cookie()
+            return self.form_invalid(form)
+
         # https://docs.djangoproject.com/en/3.1/topics/http/sessions/#setting-test-cookies
         self.request.session.delete_test_cookie()
 
@@ -229,6 +275,23 @@ class UserLoginView(mixins.AuthMixin, UserLoginContextMixin, FormView):
         ) as e:
             form.add_error('code', e.msg)
             return super().form_invalid(form)
+        except (IntegrityError,) as e:
+            # (1062, "Duplicate entry 'youtester001@example.com' for key 'users_user.email'")
+            error = str(e)
+            if len(e.args) < 2:
+                form.add_error(None, error)
+                return super().form_invalid(form)
+
+            msg_list = e.args[1].split("'")
+            if len(msg_list) < 4:
+                form.add_error(None, error)
+                return super().form_invalid(form)
+
+            email, field = msg_list[1], msg_list[3]
+            if field == 'users_user.email':
+                error = _('User email already exists ({})').format(email)
+            form.add_error(None, error)
+            return super().form_invalid(form)
         self.clear_rsa_key()
         return self.redirect_to_guard_view()
 
@@ -248,6 +311,7 @@ class UserLoginGuardView(mixins.AuthMixin, RedirectView):
     login_url = reverse_lazy('authentication:login')
     login_mfa_url = reverse_lazy('authentication:login-mfa')
     login_confirm_url = reverse_lazy('authentication:login-wait-confirm')
+    query_string = True
 
     def format_redirect_url(self, url):
         args = self.request.META.get('QUERY_STRING', '')
@@ -268,7 +332,6 @@ class UserLoginGuardView(mixins.AuthMixin, RedirectView):
             self.check_user_mfa_if_need(user)
             self.check_user_login_confirm_if_need(user)
         except (errors.CredentialError, errors.SessionEmptyError) as e:
-            print("Error: ", e)
             return self.format_redirect_url(self.login_url)
         except errors.MFARequiredError:
             return self.format_redirect_url(self.login_mfa_url)

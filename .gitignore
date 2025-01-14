@@ -16,6 +16,7 @@ dump.rdb
 .cache/
 .idea/
 .vscode/
+.fleet/
 db.sqlite3
 config.py
 config.yml
@@ -34,11 +35,14 @@ celerybeat-schedule.db
 docs/_build/
 xpack
 xpack.bak
-logs/*
 ### Vagrant ###
 .vagrant/
 release/*
 releashe
 /apps/script.py
 data/*
-
+test.py
+.history/
+.test/
+*.mo
+apps.iml

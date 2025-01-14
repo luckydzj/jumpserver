@@ -1,13 +1,15 @@
-from django.views import View
 from django.conf import settings
 from django.contrib import auth
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 from django.utils.http import urlencode
+from django.views import View
 
-from authentication.utils import build_absolute_uri
-from common.utils import get_logger
 from authentication.mixins import authenticate
+from authentication.utils import build_absolute_uri
+from authentication.views.mixins import FlashMessageMixin
+from authentication.views.utils import redirect_to_guard_view
+from common.utils import get_logger
 
 logger = get_logger(__file__)
 
@@ -26,15 +28,20 @@ class OAuth2AuthRequestView(View):
             )
         }
 
-        redirect_url = '{url}?{query}'.format(
+        if '?' in settings.AUTH_OAUTH2_PROVIDER_AUTHORIZATION_ENDPOINT:
+            separator = '&'
+        else:
+            separator = '?'
+        redirect_url = '{url}{separator}{query}'.format(
             url=settings.AUTH_OAUTH2_PROVIDER_AUTHORIZATION_ENDPOINT,
+            separator=separator,
             query=urlencode(query_dict)
         )
         logger.debug(log_prompt.format('Redirect login url'))
         return HttpResponseRedirect(redirect_url)
 
 
-class OAuth2AuthCallbackView(View):
+class OAuth2AuthCallbackView(View, FlashMessageMixin):
     http_method_names = ['get', ]
 
     def get(self, request):
@@ -46,7 +53,8 @@ class OAuth2AuthCallbackView(View):
         if 'code' in callback_params:
             logger.debug(log_prompt.format('Process authenticate'))
             user = authenticate(code=callback_params['code'], request=request)
-            if user and user.is_valid:
+
+            if user:
                 logger.debug(log_prompt.format('Login: {}'.format(user)))
                 auth.login(self.request, user)
                 logger.debug(log_prompt.format('Redirect'))
@@ -55,9 +63,15 @@ class OAuth2AuthCallbackView(View):
                 )
 
         logger.debug(log_prompt.format('Redirect'))
-        # OAuth2 服务端认证成功, 但是用户被禁用了, 这时候需要调用服务端的logout
-        redirect_url = settings.AUTH_OAUTH2_PROVIDER_END_SESSION_ENDPOINT
+        redirect_url = settings.AUTH_OAUTH2_PROVIDER_END_SESSION_ENDPOINT or '/'
         return HttpResponseRedirect(redirect_url)
+
+
+class OAuth2AuthCallbackClientView(View):
+    http_method_names = ['get', ]
+
+    def get(self, request):
+        return redirect_to_guard_view(query_string='next=client')
 
 
 class OAuth2EndSessionView(View):
@@ -81,10 +95,10 @@ class OAuth2EndSessionView(View):
             logger.debug(log_prompt.format('Log out the current user: {}'.format(request.user)))
             auth.logout(request)
 
-            if settings.AUTH_OAUTH2_LOGOUT_COMPLETELY:
+            logout_url = settings.AUTH_OAUTH2_PROVIDER_END_SESSION_ENDPOINT
+            if settings.AUTH_OAUTH2_LOGOUT_COMPLETELY and logout_url:
                 logger.debug(log_prompt.format('Log out OAUTH2 platform user session synchronously'))
-                next_url = settings.AUTH_OAUTH2_PROVIDER_END_SESSION_ENDPOINT
-                return HttpResponseRedirect(next_url)
+                return HttpResponseRedirect(logout_url)
 
         logger.debug(log_prompt.format('Redirect'))
         return HttpResponseRedirect(logout_url)
