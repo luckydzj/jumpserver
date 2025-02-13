@@ -1,13 +1,14 @@
+import re
+
 from werkzeug.local import Local
 
+
 thread_local = Local()
-encrypted_field_set = set()
+exclude_encrypted_fields = ('secret_type', 'secret_strategy', 'password_rules')
+similar_encrypted_pattern = re.compile(
+    'password|secret|token|passphrase|private|key|cert', re.IGNORECASE
+)
 
 
 def _find(attr):
     return getattr(thread_local, attr, None)
-
-
-def add_encrypted_field_set(label):
-    if label:
-        encrypted_field_set.add(str(label))

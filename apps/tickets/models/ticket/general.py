@@ -4,30 +4,38 @@ import json
 from typing import Callable
 
 from django.db import models
-from django.db.models import Q
-from django.utils.translation import ugettext_lazy as _
-from django.db.utils import IntegrityError
+from django.db.models import Prefetch, Q
 from django.db.models.fields import related
+from django.db.utils import IntegrityError
 from django.forms import model_to_dict
+from django.utils.translation import gettext_lazy as _
 
-from common.exceptions import JMSException
-from common.utils.timezone import as_current_tz
-from common.mixins.models import CommonModelMixin
+from accounts.const import AliasAccount
 from common.db.encoder import ModelJSONFieldEncoder
+from common.db.models import JMSBaseModel
+from common.exceptions import JMSException
+from common.utils import reverse, get_logger
+from common.utils.lock import DistributedLock
+from common.utils.timezone import as_current_tz
 from orgs.models import Organization
 from orgs.utils import tmp_to_org
 from tickets.const import (
     TicketType, TicketStatus, TicketState,
     TicketLevel, StepState, StepStatus
 )
-from tickets.handlers import get_ticket_handler
 from tickets.errors import AlreadyClosed
+from tickets.handlers import get_ticket_handler
 from ..flow import TicketFlow
 
-__all__ = ['Ticket', 'TicketStep', 'TicketAssignee', 'SuperTicket', 'SubTicketManager']
+logger = get_logger(__file__)
+
+__all__ = [
+    'Ticket', 'TicketStep', 'TicketAssignee',
+    'SuperTicket', 'SubTicketManager'
+]
 
 
-class TicketStep(CommonModelMixin):
+class TicketStep(JMSBaseModel):
     ticket = models.ForeignKey(
         'Ticket', related_name='ticket_steps',
         on_delete=models.CASCADE, verbose_name='Ticket'
@@ -53,7 +61,7 @@ class TicketStep(CommonModelMixin):
             assignees.update(state=state)
         self.status = StepStatus.closed
         self.state = state
-        self.save(update_fields=['state', 'status'])
+        self.save(update_fields=['state', 'status', 'date_updated'])
 
     def set_active(self):
         self.status = StepStatus.active
@@ -72,7 +80,7 @@ class TicketStep(CommonModelMixin):
         verbose_name = _("Ticket step")
 
 
-class TicketAssignee(CommonModelMixin):
+class TicketAssignee(JMSBaseModel):
     assignee = models.ForeignKey(
         'users.User', related_name='ticket_assignees',
         on_delete=models.CASCADE, verbose_name='Assignee'
@@ -139,16 +147,13 @@ class StatusMixin:
     def reject(self, processor):
         self._change_state(StepState.rejected, processor)
 
-    def reopen(self):
-        self._change_state_by_applicant(TicketState.reopen)
-
     def close(self):
         self._change_state(TicketState.closed, self.applicant)
 
     def _change_state_by_applicant(self, state):
         if state == TicketState.closed:
             self.status = TicketStatus.closed
-        elif state in [TicketState.reopen, TicketState.pending]:
+        elif state == TicketState.pending:
             self.status = TicketStatus.open
         else:
             raise ValueError("Not supported state: {}".format(state))
@@ -204,11 +209,11 @@ class StatusMixin:
 
             step_info = {
                 'state': state,
-                'approval_level': step.level,
                 'assignees': assignee_ids,
+                'processor': processor_id,
+                'approval_level': step.level,
                 'assignees_display': assignees_display,
                 'approval_date': str(step.date_updated),
-                'processor': processor_id,
                 'processor_display': processor_display
             }
             process_map.append(step_info)
@@ -224,15 +229,15 @@ class StatusMixin:
         org_id = self.flow.org_id
         flow_rules = self.flow.rules.order_by('level')
         for rule in flow_rules:
-            step = TicketStep.objects.create(ticket=self, level=rule.level)
             assignees = rule.get_assignees(org_id=org_id)
             assignees = self.exclude_applicant(assignees, self.applicant)
+            step = TicketStep.objects.create(ticket=self, level=rule.level)
             step_assignees = [TicketAssignee(step=step, assignee=user) for user in assignees]
             TicketAssignee.objects.bulk_create(step_assignees)
 
     def create_process_steps_by_assignees(self, assignees):
-        assignees = self.exclude_applicant(assignees, self.applicant)
         step = TicketStep.objects.create(ticket=self, level=1)
+        assignees = self.exclude_applicant(assignees, self.applicant)
         ticket_assignees = [TicketAssignee(step=step, assignee=user) for user in assignees]
         TicketAssignee.objects.bulk_create(ticket_assignees)
 
@@ -247,15 +252,13 @@ class StatusMixin:
 
     @property
     def processor(self):
-        processor = self.current_step.ticket_assignees \
-            .exclude(state=StepState.pending) \
-            .first()
-        return processor.assignee if processor else None
+        """ 返回最后一步的处理人 """
+        return self.current_step.processor
 
     def has_current_assignee(self, assignee):
         return self.ticket_steps.filter(
+            level=self.approval_step,
             ticket_assignees__assignee=assignee,
-            level=self.approval_step
         ).exists()
 
     def has_all_assignee(self, assignee):
@@ -266,7 +269,7 @@ class StatusMixin:
         return get_ticket_handler(ticket=self)
 
 
-class Ticket(StatusMixin, CommonModelMixin):
+class Ticket(StatusMixin, JMSBaseModel):
     title = models.CharField(max_length=256, verbose_name=_('Title'))
     type = models.CharField(
         max_length=64, choices=TicketType.choices,
@@ -282,19 +285,19 @@ class Ticket(StatusMixin, CommonModelMixin):
     )
     # 申请人
     applicant = models.ForeignKey(
-        'users.User', related_name='applied_tickets', on_delete=models.SET_NULL,
-        null=True, verbose_name=_("Applicant")
+        'users.User', related_name='applied_tickets', null=True,
+        on_delete=models.SET_NULL, verbose_name=_("Applicant")
     )
-    comment = models.TextField(default='', blank=True, verbose_name=_('Comment'))
     flow = models.ForeignKey(
-        'TicketFlow', related_name='tickets', on_delete=models.SET_NULL,
-        null=True, verbose_name=_('TicketFlow')
+        'TicketFlow', related_name='tickets', null=True,
+        on_delete=models.SET_NULL, verbose_name=_('TicketFlow')
     )
     approval_step = models.SmallIntegerField(
         default=TicketLevel.one, choices=TicketLevel.choices, verbose_name=_('Approval step')
     )
-    serial_num = models.CharField(_('Serial number'), max_length=128, unique=True, null=True)
+    comment = models.TextField(default='', blank=True, verbose_name=_('Comment'))
     rel_snapshot = models.JSONField(verbose_name=_('Relation snapshot'), default=dict)
+    serial_num = models.CharField(_('Serial number'), max_length=128, null=True)
     meta = models.JSONField(encoder=ModelJSONFieldEncoder, default=dict, verbose_name=_("Meta"))
     org_id = models.CharField(
         max_length=36, blank=True, default='', verbose_name=_('Organization'), db_index=True
@@ -303,6 +306,9 @@ class Ticket(StatusMixin, CommonModelMixin):
     class Meta:
         ordering = ('-date_created',)
         verbose_name = _('Ticket')
+        unique_together = (
+            ('serial_num',),
+        )
 
     def __str__(self):
         return '{}({})'.format(self.title, self.applicant)
@@ -324,7 +330,13 @@ class Ticket(StatusMixin, CommonModelMixin):
     @classmethod
     def get_user_related_tickets(cls, user):
         queries = Q(applicant=user) | Q(ticket_steps__ticket_assignees__assignee=user)
-        tickets = cls.objects.all().filter(queries).distinct()
+        # TODO: 与 StatusMixin.process_map 内连表查询有部分重叠 有优化空间 待验证排除是否不影响其它调用
+        prefetch_ticket_assignee = Prefetch('ticket_steps__ticket_assignees',
+                                            queryset=TicketAssignee.objects.select_related('assignee'), )
+        tickets = cls.objects.prefetch_related(prefetch_ticket_assignee) \
+            .select_related('applicant') \
+            .filter(queries) \
+            .distinct()
         return tickets
 
     def get_current_ticket_flow_approve(self):
@@ -365,30 +377,33 @@ class Ticket(StatusMixin, CommonModelMixin):
         date_created = as_current_tz(self.date_created)
         date_prefix = date_created.strftime('%Y%m%d')
 
-        ticket = Ticket.objects.all().select_for_update().filter(
+        ticket = Ticket.objects.filter(
             serial_num__startswith=date_prefix
-        ).order_by('-date_created').first()
+        ).order_by('-serial_num').first()
 
         last_num = 0
         if ticket:
             last_num = ticket.serial_num[8:]
             last_num = int(last_num)
         num = '%04d' % (last_num + 1)
-        return '{}{}'.format(date_prefix, num)
+        return f'{date_prefix}{num}'
 
     def set_serial_num(self):
         if self.serial_num:
             return
 
-        try:
-            self.serial_num = self.get_next_serial_num()
-            self.save(update_fields=('serial_num',))
-        except IntegrityError as e:
-            if e.args[0] == 1062:
-                # 虽然做了 `select_for_update` 但是每天的第一条工单仍可能造成冲突
-                # 但概率小，这里只报错，用户重新提交即可
-                raise JMSException(detail=_('Please try again'), code='please_try_again')
-            raise e
+        lock_key = 'TICKET_LOCK_SET_SERIAL_NUM'
+        with DistributedLock(lock_key):
+            try:
+                self.serial_num = self.get_next_serial_num()
+                self.save(update_fields=('serial_num',))
+            except IntegrityError as e:
+                logger.error(f'Set ticket serial number error: {e}')
+                if e.args[0] == 1062:
+                    # 虽然做了 `select_for_update` 但是每天的第一条工单仍可能造成冲突
+                    # 但概率小，这里只报错，用户重新提交即可
+                    raise JMSException(detail=_('Please try again'), code='please_try_again')
+                raise e
 
     def get_field_display(self, name, field, data: dict):
         value = data.get(name)
@@ -397,22 +412,70 @@ class Ticket(StatusMixin, CommonModelMixin):
         elif isinstance(field, related.ForeignKey):
             value = self.rel_snapshot[name]
         elif isinstance(field, related.ManyToManyField):
-            value = ', '.join(self.rel_snapshot[name])
+            if isinstance(self.rel_snapshot[name], str):
+                value = self.rel_snapshot[name]
+            elif isinstance(self.rel_snapshot[name], list):
+                value = ','.join(self.rel_snapshot[name])
+        elif name == 'apply_accounts':
+            new_values = []
+            for account in value:
+                alias = dict(AliasAccount.choices).get(account)
+                new_value = alias if alias else account
+                new_values.append(str(new_value))
+            value = ', '.join(new_values)
+        elif name == 'org_id':
+            org = Organization.get_instance(value)
+            value = org.name if org else ''
+        elif isinstance(value, list):
+            value = ', '.join(value)
         return value
 
     def get_local_snapshot(self):
+        snapshot = {}
+        excludes = ['ticket_ptr']
         fields = self._meta._forward_fields_map
         json_data = json.dumps(model_to_dict(self), cls=ModelJSONFieldEncoder)
         data = json.loads(json_data)
-        snapshot = {}
         local_fields = self._meta.local_fields + self._meta.local_many_to_many
-        excludes = ['ticket_ptr']
         item_names = [field.name for field in local_fields if field.name not in excludes]
         for name in item_names:
             field = fields[name]
             value = self.get_field_display(name, field, data)
             snapshot[field.verbose_name] = value
         return snapshot
+
+    def get_extra_info_of_review(self, user=None):
+        if user and user.is_service_account:
+            url_ticket_status = reverse(
+                view_name='api-tickets:super-ticket-status', kwargs={'pk': str(self.id)}
+            )
+            check_ticket_api = {'method': 'GET', 'url': url_ticket_status}
+            close_ticket_api = {'method': 'DELETE', 'url': url_ticket_status}
+        else:
+            url_ticket_status = reverse(
+                view_name='api-tickets:ticket-detail', kwargs={'pk': str(self.id)}
+            )
+            url_ticket_close = reverse(
+                view_name='api-tickets:ticket-close', kwargs={'pk': str(self.id)}
+            )
+            check_ticket_api = {'method': 'GET', 'url': url_ticket_status}
+            close_ticket_api = {'method': 'PUT', 'url': url_ticket_close}
+
+        url_ticket_detail_external = reverse(
+            view_name='api-tickets:ticket-detail',
+            kwargs={'pk': str(self.id)},
+            external=True,
+            api_to_ui=True
+        )
+        ticket_assignees = self.current_step.ticket_assignees.all()
+        return {
+            'check_ticket_api': check_ticket_api,
+            'close_ticket_api': close_ticket_api,
+            'ticket_detail_page_url': '{url}?type={type}'.format(
+                url=url_ticket_detail_external, type=self.type
+            ),
+            'assignees': [str(ticket_assignee.assignee) for ticket_assignee in ticket_assignees]
+        }
 
 
 class SuperTicket(Ticket):

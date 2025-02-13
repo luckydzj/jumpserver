@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 #
-from django.utils.translation import ugettext_lazy as _
 from django.conf import settings
+from django.utils.translation import gettext_lazy as _
 
 from users.utils import LoginBlockUtil, MFABlockUtils, LoginIpBlockUtil
-from ..signals import post_auth_failed
 from . import const
+from ..signals import post_auth_failed
 
 
 class AuthFailedNeedLogMixin:
@@ -52,6 +52,10 @@ class AuthFailedError(Exception):
         return str(self.msg)
 
 
+class SSOAuthKeyTTLError(Exception):
+    msg = 'sso_authkey_timeout'
+
+
 class BlockGlobalIpLoginError(AuthFailedError):
     error = 'block_global_ip_login'
 
@@ -89,8 +93,6 @@ class MFAFailedError(AuthFailedNeedLogMixin, AuthFailedError):
     msg: str
 
     def __init__(self, username, request, ip, mfa_type, error):
-        super().__init__(username=username, request=request)
-
         util = MFABlockUtils(username, ip)
         times_remainder = util.incr_failed_count()
         block_time = settings.SECURITY_LOGIN_LIMIT_TIME
@@ -101,6 +103,7 @@ class MFAFailedError(AuthFailedNeedLogMixin, AuthFailedError):
             )
         else:
             self.msg = const.block_mfa_msg.format(settings.SECURITY_LOGIN_LIMIT_TIME)
+        super().__init__(username=username, request=request)
 
 
 class BlockMFAError(AuthFailedNeedLogMixin, AuthFailedError):
@@ -139,11 +142,11 @@ class ACLError(AuthFailedNeedLogMixin, AuthFailedError):
         }
 
 
-class LoginACLIPAndTimePeriodNotAllowed(ACLError):
+class LoginACLNotAllowed(ACLError):
     def __init__(self, username, request, **kwargs):
         self.username = username
         self.request = request
-        super().__init__(_("Current IP and Time period is not allowed"), **kwargs)
+        super().__init__(_("Current login is prohibited by ACL rules"), **kwargs)
 
 
 class MFACodeRequiredError(AuthFailedError):

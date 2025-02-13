@@ -1,12 +1,12 @@
-from django.utils.translation import ugettext as _
 from django.template.loader import render_to_string
+from django.utils.translation import gettext as _
 
-from common.utils import get_logger
+from common.utils import get_logger, convert_html_to_markdown
+from tickets.const import TicketState, TicketType
 from tickets.utils import (
     send_ticket_processed_mail_to_applicant,
     send_ticket_applied_mail_to_assignees
 )
-from tickets.const import TicketState, TicketType
 
 logger = get_logger(__name__)
 
@@ -65,7 +65,7 @@ class BaseHandler:
         if state != TicketState.approved:
             return diff_context
 
-        if self.ticket.type not in [TicketType.apply_asset, TicketType.apply_application]:
+        if self.ticket.type != TicketType.apply_asset:
             return diff_context
 
         # 企业微信，钉钉审批不做diff
@@ -86,7 +86,7 @@ class BaseHandler:
 
     def _create_state_change_comment(self, state):
         # 打开或关闭工单，备注显示是自己，其他是受理人
-        if state in [TicketState.reopen, TicketState.pending, TicketState.closed]:
+        if state in [TicketState.pending, TicketState.closed]:
             user = self.ticket.applicant
         else:
             user = self.ticket.processor
@@ -96,8 +96,10 @@ class BaseHandler:
         approve_info = _('{} {} the ticket').format(user_display, state_display)
         context = self._diff_prev_approve_context(state)
         context.update({'approve_info': approve_info})
+        html_str = render_to_string('tickets/ticket_approve_diff.html', context)
+        body = convert_html_to_markdown(html_str)
         data = {
-            'body': render_to_string('tickets/ticket_approve_diff.html', context),
+            'body': body,
             'user': user,
             'user_display': str(user),
             'type': 'state',

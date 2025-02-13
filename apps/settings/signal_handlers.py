@@ -3,28 +3,23 @@
 import json
 
 from django.conf import LazySettings
-from django.db.models.signals import post_save, pre_save
+from django.db.models.signals import post_save
 from django.db.utils import ProgrammingError, OperationalError
 from django.dispatch import receiver
 from django.utils.functional import LazyObject
 
-from common.decorator import on_transaction_commit
+from common.decorators import on_transaction_commit
 from common.signals import django_ready
 from common.utils import get_logger, ssh_key_gen
 from common.utils.connection import RedisPubSub
-from jumpserver.utils import current_request
 from .models import Setting
 
 logger = get_logger(__file__)
 
 
-def get_settings_pub_sub():
-    return RedisPubSub('settings')
-
-
 class SettingSubPub(LazyObject):
     def _setup(self):
-        self._wrapped = get_settings_pub_sub()
+        self._wrapped = RedisPubSub('settings')
 
 
 setting_pub_sub = SettingSubPub()
@@ -35,15 +30,12 @@ setting_pub_sub = SettingSubPub()
 def refresh_settings_on_changed(sender, instance=None, **kwargs):
     if not instance:
         return
-
     setting_pub_sub.publish(instance.name)
-
-    # 配置变化: PERM_SINGLE_ASSET_TO_UNGROUP_NODE
-    if instance.name == 'PERM_SINGLE_ASSET_TO_UNGROUP_NODE':
-        # 清除所有用户授权树已构建的标记，下次访问重新生成
-        logger.debug('Clean ALL User perm tree built mark')
-        from perms.utils.asset import UserGrantedTreeRefreshController
-        UserGrantedTreeRefreshController.clean_all_user_tree_built_mark()
+    if instance.is_name('PERM_SINGLE_ASSET_TO_UNGROUP_NODE'):
+        """ 过期所有用户授权树 """
+        logger.debug('Expire all user perm tree')
+        from perms.utils import UserPermTreeExpireUtil
+        UserPermTreeExpireUtil().expire_perm_tree_for_all_user()
 
 
 @receiver(django_ready)
@@ -61,19 +53,6 @@ def auto_generate_terminal_host_key(sender, **kwargs):
         Setting.objects.create(name='TERMINAL_HOST_KEY', value=value)
     except:
         pass
-
-
-@receiver(pre_save, dispatch_uid="my_unique_identifier")
-def on_create_set_created_by(sender, instance=None, **kwargs):
-    if getattr(instance, '_ignore_auto_created_by', False) is True:
-        return
-    if not hasattr(instance, 'created_by') or instance.created_by:
-        return
-    if current_request and current_request.user.is_authenticated:
-        user_name = current_request.user.name
-        if isinstance(user_name, str):
-            user_name = user_name[:30]
-        instance.created_by = user_name
 
 
 @receiver(django_ready)

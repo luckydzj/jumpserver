@@ -1,6 +1,6 @@
 import abc
 
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 
 class BaseMFA(abc.ABC):
@@ -12,9 +12,13 @@ class BaseMFA(abc.ABC):
         因为首页登录时，可能没法获取到一些状态
         """
         self.user = user
+        self.request = None
 
     def is_authenticated(self):
         return self.user and self.user.is_authenticated
+
+    def set_request(self, request):
+        self.request = request
 
     @property
     @abc.abstractmethod
@@ -69,4 +73,3 @@ class BaseMFA(abc.ABC):
     @staticmethod
     def help_text_of_disable():
         return ''
-

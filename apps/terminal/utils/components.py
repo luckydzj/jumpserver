@@ -3,9 +3,55 @@
 from itertools import groupby
 
 from common.utils import get_logger
-
+from terminal.const import ComponentLoad, TerminalType
 
 logger = get_logger(__name__)
+
+
+class ComputeLoadUtil:
+    # system status
+    @staticmethod
+    def _common_compute_system_status(value, thresholds):
+        if thresholds[0] <= value <= thresholds[1]:
+            return ComponentLoad.normal.value
+        elif thresholds[1] < value <= thresholds[2]:
+            return ComponentLoad.high.value
+        else:
+            return ComponentLoad.critical.value
+
+    @classmethod
+    def _compute_system_stat_status(cls, stat):
+        system_stat_thresholds_mapper = {
+            'cpu_load': [0, 5, 20],
+            'memory_used': [0, 85, 95],
+            'disk_used': [0, 80, 99]
+        }
+        system_status = {}
+        for stat_key, thresholds in system_stat_thresholds_mapper.items():
+            stat_value = getattr(stat, stat_key)
+            if stat_value is None:
+                msg = 'stat: {}, stat_key: {}, stat_value: {}'
+                logger.debug(msg.format(stat, stat_key, stat_value))
+                stat_value = 0
+            status = cls._common_compute_system_status(stat_value, thresholds)
+            system_status[stat_key] = status
+        return system_status
+
+    @classmethod
+    def compute_load(cls, stat, terminal_type=None):
+        if not stat:
+            # TODO The core component and celery component will return true for the time being.
+            if terminal_type in [TerminalType.core, TerminalType.celery]:
+                return ComponentLoad.normal
+            else:
+                return ComponentLoad.offline
+        system_status_values = cls._compute_system_stat_status(stat).values()
+        if ComponentLoad.critical in system_status_values:
+            return ComponentLoad.critical
+        elif ComponentLoad.high in system_status_values:
+            return ComponentLoad.high
+        else:
+            return ComponentLoad.normal
 
 
 class TypedComponentsStatusMetricsUtil(object):
@@ -25,31 +71,20 @@ class TypedComponentsStatusMetricsUtil(object):
     def get_metrics(self):
         metrics = []
         for _tp, components in self.grouped_components:
-            normal_count = high_count = critical_count = 0
-            total_count = offline_count = session_online_total = 0
-
-            for component in components:
-                total_count += 1
-                if not component.is_alive:
-                    offline_count += 1
-                    continue
-                if component.is_normal:
-                    normal_count += 1
-                elif component.is_high:
-                    high_count += 1
-                else:
-                    # critical
-                    critical_count += 1
-                session_online_total += component.get_online_session_count()
-            metrics.append({
-                'total': total_count,
-                'normal': normal_count,
-                'high': high_count,
-                'critical': critical_count,
-                'offline': offline_count,
-                'session_active': session_online_total,
+            metric = {
+                'total': 0,
                 'type': _tp,
-            })
+                'session_active': 0,
+                ComponentLoad.high: [],
+                ComponentLoad.normal: [],
+                ComponentLoad.offline: [],
+                ComponentLoad.critical: [],
+            }
+            for component in components:
+                metric[component.load].append(component.name)
+                metric['total'] += 1
+                metric['session_active'] += component.get_online_session_count()
+            metrics.append(metric)
         return metrics
 
 
@@ -62,10 +97,10 @@ class ComponentsPrometheusMetricsUtil(TypedComponentsStatusMetricsUtil):
     def convert_status_metrics(metrics):
         return {
             'any': metrics['total'],
-            'normal': metrics['normal'],
-            'high': metrics['high'],
-            'critical': metrics['critical'],
-            'offline': metrics['offline']
+            'normal': len(metrics['normal']),
+            'high': len(metrics['high']),
+            'critical': len(metrics['critical']),
+            'offline': len(metrics['offline'])
         }
 
     def get_component_status_metrics(self):
@@ -77,8 +112,8 @@ class ComponentsPrometheusMetricsUtil(TypedComponentsStatusMetricsUtil):
             tp = metric['type']
             prometheus_metrics.append(f'## 组件: {tp}')
             status_metrics = self.convert_status_metrics(metric)
-            for status, value in status_metrics.items():
-                metric_text = status_metric_text % (tp, status, value)
+            for status, count in status_metrics.items():
+                metric_text = status_metric_text % (tp, status, count)
                 prometheus_metrics.append(metric_text)
         return prometheus_metrics
 
@@ -114,7 +149,7 @@ class ComponentsPrometheusMetricsUtil(TypedComponentsStatusMetricsUtil):
             for component in self.components:
                 if not component.is_alive:
                     continue
-                component_stat = component.latest_stat
+                component_stat = component.last_stat
                 if not component_stat:
                     continue
                 metric_text = state_metric_text % (
@@ -139,4 +174,3 @@ class ComponentsPrometheusMetricsUtil(TypedComponentsStatusMetricsUtil):
             prometheus_metrics.append('\n')
         prometheus_metrics_text = '\n'.join(prometheus_metrics)
         return prometheus_metrics_text
-

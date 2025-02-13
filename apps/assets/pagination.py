@@ -1,13 +1,16 @@
 from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.request import Request
 
-from common.utils import get_logger
 from assets.models import Node
+from common.utils import get_logger
 
 logger = get_logger(__name__)
 
 
 class AssetPaginationBase(LimitOffsetPagination):
+    _request = None
+    _view = None
+    _user = None
 
     def init_attrs(self, queryset, request: Request, view=None):
         self._request = request
@@ -25,10 +28,12 @@ class AssetPaginationBase(LimitOffsetPagination):
             'key', 'all', 'show_current_asset',
             'cache_policy', 'display', 'draw',
             'order', 'node', 'node_id', 'fields_size',
+            'asset'
         }
         for k, v in self._request.query_params.items():
             if k not in exclude_query_params and v is not None:
-                logger.warn(f'Not hit node.assets_amount because find a unknow query_param `{k}` -> {self._request.get_full_path()}')
+                logger.warn(f'Not hit node.assets_amount because find a unknown query_param '
+                            f'`{k}` -> {self._request.get_full_path()}')
                 return super().get_count(queryset)
         node_assets_count = self.get_count_from_nodes(queryset)
         if node_assets_count is None:
@@ -42,11 +47,11 @@ class AssetPaginationBase(LimitOffsetPagination):
 class NodeAssetTreePagination(AssetPaginationBase):
     def get_count_from_nodes(self, queryset):
         is_query_all = self._view.is_query_node_all_assets
-        if is_query_all:
-            node = self._view.node
-            if not node:
-                node = Node.org_root()
-            if node:
-                logger.debug(f'Hit node.assets_amount[{node.assets_amount}] -> {self._request.get_full_path()}')
-                return node.assets_amount
-        return None
+        if not is_query_all:
+            return None
+        node = self._view.node
+        if not node:
+            node = Node.org_root()
+        if node:
+            logger.debug(f'Hit node assets_amount cache: [{node.assets_amount}]')
+        return node.assets_amount

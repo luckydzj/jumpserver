@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 #
-import struct
 import random
+import secrets
 import socket
 import string
-
+import struct
 
 string_punctuation = '!#$%&()*+,-.:;<=>?@[]^_~'
 
@@ -18,35 +18,68 @@ def random_ip():
     return socket.inet_ntoa(struct.pack('>I', random.randint(1, 0xffffffff)))
 
 
-def random_string(length: int, lower=True, upper=True, digit=True, special_char=False):
-    args_names = ['lower', 'upper', 'digit', 'special_char']
-    args_values = [lower, upper, digit, special_char]
-    args_string = [string.ascii_lowercase, string.ascii_uppercase, string.digits, string_punctuation]
-    args_string_map = dict(zip(args_names, args_string))
-    kwargs = dict(zip(args_names, args_values))
-    kwargs_keys = list(kwargs.keys())
-    kwargs_values = list(kwargs.values())
-    args_true_count = len([i for i in kwargs_values if i])
-    assert any(kwargs_values), f'Parameters {kwargs_keys} must have at least one `True`'
-    assert length >= args_true_count, f'Expected length >= {args_true_count}, bug got {length}'
+def random_replace_char(seq, chars, length):
+    using_index = set()
 
-    can_startswith_special_char = args_true_count == 1 and special_char
+    while length > 0:
+        index = secrets.randbelow(len(seq) - 1)
+        if index in using_index or index == 0:
+            continue
+        seq[index] = secrets.choice(chars)
+        using_index.add(index)
+        length -= 1
+    return seq
 
-    chars = ''.join([args_string_map[k] for k, v in kwargs.items() if v])
 
-    while True:
-        password = list(random.choice(chars) for i in range(length))
-        for k, v in kwargs.items():
-            if v and not (set(password) & set(args_string_map[k])):
-                # 没有包含指定的字符, retry
-                break
-        else:
-            if not can_startswith_special_char and password[0] in args_string_map['special_char']:
-                # 首位不能为特殊字符, retry
-                continue
-            else:
-                # 满足要求终止 while 循环
-                break
+def remove_exclude_char(s, exclude_chars):
+    for i in exclude_chars:
+        s = s.replace(i, '')
+    return s
 
-    password = ''.join(password)
-    return password
+
+def random_string(
+        length: int, lower=True, upper=True, digit=True,
+        special_char=False, exclude_chars='', symbols=string_punctuation
+):
+    if not any([lower, upper, digit]):
+        raise ValueError('At least one of `lower`, `upper`, `digit` must be `True`')
+    if length < 4:
+        raise ValueError('The length of the string must be greater than 3')
+
+    char_list = []
+    if lower:
+
+        lower_chars = remove_exclude_char(string.ascii_lowercase, exclude_chars)
+        if not lower_chars:
+            raise ValueError('After excluding characters, no lowercase letters are available.')
+        char_list.append(lower_chars)
+
+    if upper:
+        upper_chars = remove_exclude_char(string.ascii_uppercase, exclude_chars)
+        if not upper_chars:
+            raise ValueError('After excluding characters, no uppercase letters are available.')
+        char_list.append(upper_chars)
+
+    if digit:
+        digit_chars = remove_exclude_char(string.digits, exclude_chars)
+        if not digit_chars:
+            raise ValueError('After excluding characters, no digits are available.')
+        char_list.append(digit_chars)
+
+    secret_chars = [secrets.choice(chars) for chars in char_list]
+
+    all_chars = ''.join(char_list)
+
+    remaining_length = length - len(secret_chars)
+    seq = [secrets.choice(all_chars) for _ in range(remaining_length)]
+
+    if special_char:
+        special_chars = remove_exclude_char(symbols, exclude_chars)
+        if not special_chars:
+            raise ValueError('After excluding characters, no special characters are available.')
+        symbol_num = length // 16 + 1
+        seq = random_replace_char(seq, symbols, symbol_num)
+    secret_chars += seq
+
+    secrets.SystemRandom().shuffle(secret_chars)
+    return ''.join(secret_chars)

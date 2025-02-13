@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 #
-
 from rest_framework import viewsets, mixins
+
 from common.exceptions import JMSException
 from common.utils import lazyproperty
 from rbac.permissions import RBACPermission
 from tickets import serializers
 from tickets.models import Ticket, Comment
 from tickets.permissions.comment import IsAssignee, IsApplicant, IsSwagger
-
 
 __all__ = ['CommentViewSet']
 
