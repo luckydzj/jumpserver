@@ -1,13 +1,16 @@
 # ~*~ coding: utf-8 ~*~
 
+import json
 import os
 import re
+import time
+
 import pytz
-from django.utils import timezone
-from django.shortcuts import HttpResponse
 from django.conf import settings
 from django.core.exceptions import MiddlewareNotUsed
 from django.http.response import HttpResponseForbidden
+from django.shortcuts import HttpResponse
+from django.utils import timezone
 
 from .utils import set_current_request
 
@@ -63,11 +66,6 @@ class RequestMiddleware:
     def __call__(self, request):
         set_current_request(request)
         response = self.get_response(request)
-        is_request_api = request.path.startswith('/api')
-        if not settings.SESSION_EXPIRE_AT_BROWSER_CLOSE and \
-                not is_request_api:
-            age = request.session.get_expiry_age()
-            request.session.set_expiry(age)
         return response
 
 
@@ -91,4 +89,51 @@ class RefererCheckMiddleware:
         if not match:
             return HttpResponseForbidden('CSRF CHECK ERROR')
         response = self.get_response(request)
+        return response
+
+
+class SQLCountMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+        if not settings.DEBUG_DEV:
+            raise MiddlewareNotUsed
+
+    def __call__(self, request):
+        from django.db import connection
+        response = self.get_response(request)
+        response['X-JMS-SQL-COUNT'] = len(connection.queries) - 2
+        return response
+
+
+class StartMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+        if not settings.DEBUG_DEV:
+            raise MiddlewareNotUsed
+
+    def __call__(self, request):
+        request._s_time_start = time.time()
+        response = self.get_response(request)
+        request._s_time_end = time.time()
+        if request.path == '/api/health/':
+            data = response.data
+            data['pre_middleware_time'] = request._e_time_start - request._s_time_start
+            data['api_time'] = request._e_time_end - request._e_time_start
+            data['post_middleware_time'] = request._s_time_end - request._e_time_end
+            response.content = json.dumps(data)
+            response.headers['Content-Length'] = str(len(response.content))
+            return response
+        return response
+
+
+class EndMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+        if not settings.DEBUG_DEV:
+            raise MiddlewareNotUsed
+
+    def __call__(self, request):
+        request._e_time_start = time.time()
+        response = self.get_response(request)
+        request._e_time_end = time.time()
         return response

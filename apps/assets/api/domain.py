@@ -1,15 +1,15 @@
 # ~*~ coding: utf-8 ~*~
-
+from django.utils.translation import gettext as _
 from django.views.generic.detail import SingleObjectMixin
-from django.utils.translation import ugettext as _
-from rest_framework.views import APIView, Response
 from rest_framework.serializers import ValidationError
+from rest_framework.views import APIView, Response
 
+from assets.tasks import test_gateways_connectivity_manual
 from common.utils import get_logger
 from orgs.mixins.api import OrgBulkModelViewSet
-from ..models import Domain, Gateway
+from .asset import HostViewSet
 from .. import serializers
-
+from ..models import Domain, Gateway
 
 logger = get_logger(__file__)
 __all__ = ['DomainViewSet', 'GatewayViewSet', "GatewayTestConnectionApi"]
@@ -17,41 +17,53 @@ __all__ = ['DomainViewSet', 'GatewayViewSet', "GatewayTestConnectionApi"]
 
 class DomainViewSet(OrgBulkModelViewSet):
     model = Domain
-    filterset_fields = ("name", )
+    filterset_fields = ("name",)
     search_fields = filterset_fields
-    serializer_class = serializers.DomainSerializer
-    ordering_fields = ('name',)
-    ordering = ('name', )
+    serializer_classes = {
+        'default': serializers.DomainSerializer,
+        'list': serializers.DomainListSerializer,
+    }
 
     def get_serializer_class(self):
         if self.request.query_params.get('gateway'):
             return serializers.DomainWithGatewaySerializer
         return super().get_serializer_class()
 
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
-class GatewayViewSet(OrgBulkModelViewSet):
-    model = Gateway
-    filterset_fields = ("domain__name", "name", "username", "ip", "domain")
-    search_fields = ("domain__name", "name", "username", "ip")
-    serializer_class = serializers.GatewaySerializer
+
+class GatewayViewSet(HostViewSet):
+    perm_model = Gateway
+    filterset_fields = ("domain__name", "name", "domain")
+    search_fields = ("domain__name",)
+
+    def get_serializer_classes(self):
+        serializer_classes = super().get_serializer_classes()
+        serializer_classes['default'] = serializers.GatewaySerializer
+        return serializer_classes
+
+    def get_queryset(self):
+        queryset = Domain.get_gateway_queryset()
+        return queryset
 
 
 class GatewayTestConnectionApi(SingleObjectMixin, APIView):
-    queryset = Gateway.objects.all()
-    object = None
     rbac_perms = {
-        'POST': 'assets.test_gateway'
+        'POST': 'assets.test_assetconnectivity'
     }
 
+    def get_queryset(self):
+        queryset = Domain.get_gateway_queryset()
+        return queryset
+
     def post(self, request, *args, **kwargs):
-        self.object = self.get_object(Gateway.objects.all())
-        local_port = self.request.data.get('port') or self.object.port
+        gateway = self.get_object()
+        local_port = self.request.data.get('port') or gateway.port
         try:
             local_port = int(local_port)
         except ValueError:
             raise ValidationError({'port': _('Number required')})
-        ok, e = self.object.test_connective(local_port=local_port)
-        if ok:
-            return Response("ok")
-        else:
-            return Response({"error": e}, status=400)
+        task = test_gateways_connectivity_manual([gateway.id], local_port)
+        return Response({'task': task.id})

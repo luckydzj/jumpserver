@@ -1,21 +1,23 @@
 # ~*~ coding: utf-8 ~*~
-import time
+import os
 
+from django.conf import settings
+from django.contrib.auth import logout as auth_logout
+from django.http.response import HttpResponseRedirect
+from django.shortcuts import redirect
+from django.templatetags.static import static
 from django.urls import reverse
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
+from django.utils._os import safe_join
 from django.views.generic.base import TemplateView
 from django.views.generic.edit import FormView
-from django.contrib.auth import logout as auth_logout
-from django.shortcuts import redirect
-from django.http.response import HttpResponseRedirect
 
-from authentication.mixins import AuthMixin
-from authentication.mfa import MFAOtp, otp_failed_msg
 from authentication.errors import SessionEmptyError
-from common.utils import get_logger, FlashMessageUtil
-from common.mixins.views import PermissionsMixin
+from authentication.mfa import MFAOtp, otp_failed_msg
+from authentication.mixins import AuthMixin
 from common.permissions import IsValidUser
-from .password import UserVerifyPasswordView
+from common.utils import get_logger, FlashMessageUtil
+from common.views.mixins import PermissionsMixin
 from ... import forms
 from ...utils import (
     generate_otp_uri, check_otp_code,
@@ -47,9 +49,26 @@ class UserOtpEnableStartView(AuthMixin, TemplateView):
 class UserOtpEnableInstallAppView(TemplateView):
     template_name = 'users/user_otp_enable_install_app.html'
 
+    @staticmethod
+    def replace_authenticator_png(platform):
+        media_url = settings.MEDIA_URL
+        base_path = f'img/authenticator_{platform}.png'
+        authenticator_media_path = safe_join(settings.MEDIA_ROOT, base_path)
+        if os.path.exists(authenticator_media_path):
+            authenticator_url = f'{media_url}{base_path}'
+        else:
+            authenticator_url = static(base_path)
+        return authenticator_url
+
     def get_context_data(self, **kwargs):
         user = get_user_or_pre_auth_user(self.request)
-        context = {'user': user}
+        authenticator_android_url = self.replace_authenticator_png('android')
+        authenticator_iphone_url = self.replace_authenticator_png('iphone')
+        context = {
+            'user': user,
+            'authenticator_android_url': authenticator_android_url,
+            'authenticator_iphone_url': authenticator_iphone_url
+        }
         kwargs.update(context)
         return super().get_context_data(**kwargs)
 
@@ -168,5 +187,3 @@ class UserOtpDisableView(PermissionsMixin, FormView):
         }
         url = FlashMessageUtil.gen_message_url(message_data)
         return url
-
-

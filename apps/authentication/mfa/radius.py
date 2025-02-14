@@ -1,5 +1,5 @@
-from django.utils.translation import ugettext_lazy as _
 from django.conf import settings
+from django.utils.translation import gettext_lazy as _
 
 from .base import BaseMFA
 from ..backends.radius import RadiusBackend
@@ -12,7 +12,7 @@ class MFARadius(BaseMFA):
     display_name = 'Radius'
     placeholder = _("Radius verification code")
 
-    def check_code(self, code):
+    def check_code(self, code=None):
         assert self.is_authenticated()
         backend = RadiusBackend()
         username = self.user.username

@@ -1,14 +1,15 @@
-from django.db.models import F, Value
-from django.db.models.functions import Concat
-from django_filters.rest_framework import CharFilter
+from django.apps import apps
+from django.utils import translation
+
+from django_filters import rest_framework as drf_filters
 from rest_framework import filters
 from rest_framework.compat import coreapi, coreschema
-
-from orgs.utils import current_org
-from ops.models import CommandExecution
 from common.drf.filters import BaseFilterSet
+from common.sessions.cache import user_session_manager
+from orgs.utils import current_org
+from .models import UserSession, OperateLog
 
-__all__ = ['CurrentOrgMembersFilter', 'CommandExecutionFilter']
+__all__ = ['CurrentOrgMembersFilter']
 
 
 class CurrentOrgMembersFilter(filters.BaseFilterBackend):
@@ -36,20 +37,37 @@ class CurrentOrgMembersFilter(filters.BaseFilterBackend):
         return queryset
 
 
-class CommandExecutionFilter(BaseFilterSet):
-    hostname_ip = CharFilter(method='filter_hostname_ip')
+class UserSessionFilterSet(BaseFilterSet):
+    is_active = drf_filters.BooleanFilter(method='filter_is_active')
+
+    @staticmethod
+    def filter_is_active(queryset, name, is_active):
+        keys = user_session_manager.get_active_keys()
+        if is_active:
+            queryset = queryset.filter(key__in=keys)
+        else:
+            queryset = queryset.exclude(key__in=keys)
+        return queryset
 
     class Meta:
-        model = CommandExecution.hosts.through
-        fields = (
-            'id', 'asset', 'commandexecution', 'hostname_ip'
-        )
+        model = UserSession
+        fields = ['id', 'ip', 'city', 'type']
 
-    def filter_hostname_ip(self, queryset, name, value):
-        queryset = queryset.annotate(
-            hostname_ip=Concat(
-                F('asset__hostname'), Value('('),
-                F('asset__ip'), Value(')')
-            )
-        ).filter(hostname_ip__icontains=value)
+
+class OperateLogFilterSet(BaseFilterSet):
+    resource_type = drf_filters.CharFilter(method='filter_resource_type')
+
+    @staticmethod
+    def filter_resource_type(queryset, name, resource_type):
+        current_lang = translation.get_language()
+        with translation.override(current_lang):
+            mapper = {str(m._meta.verbose_name): m._meta.verbose_name_raw for m in apps.get_models()}
+        tp = mapper.get(resource_type)
+        queryset = queryset.filter(resource_type=tp)
         return queryset
+
+    class Meta:
+        model = OperateLog
+        fields = [
+            'user', 'action', 'resource', 'remote_addr'
+        ]

@@ -2,98 +2,265 @@
 #
 from importlib import import_module
 
-from rest_framework.mixins import ListModelMixin, CreateModelMixin, RetrieveModelMixin
-from django.db.models import F, Value
-from django.db.models.functions import Concat
 from django.conf import settings
-from rest_framework.permissions import IsAuthenticated
+from django.db.models import F, Value, CharField, Q
+from django.db.models.functions import Cast
+from django.http import HttpResponse, FileResponse
+from django.utils.encoding import escape_uri_path
+from django_celery_beat.models import PeriodicTask
 from rest_framework import generics
+from rest_framework import status
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
-from common.drf.api import JMSReadOnlyModelViewSet
+from common.api import CommonApiMixin
+from common.const.http import GET, POST
+from common.drf.filters import DatetimeRangeFilterBackend
+from common.permissions import IsServiceAccount
 from common.plugins.es import QuerySet as ESQuerySet
-from common.drf.filters import DatetimeRangeFilter
-from common.api import CommonGenericViewSet
-from orgs.mixins.api import OrgGenericViewSet, OrgBulkModelViewSet, OrgRelationMixin
-from orgs.utils import current_org
-from ops.models import CommandExecution
-from . import filters
+from common.sessions.cache import user_session_manager
+from common.storage.ftp_file import FTPFileStorageHandler
+from common.utils import is_uuid, get_logger, lazyproperty
+from ops.const import Types
+from ops.models import Job
+from ops.serializers.job import JobSerializer
+from orgs.mixins.api import OrgReadonlyModelViewSet, OrgModelViewSet
+from orgs.models import Organization
+from orgs.utils import current_org, tmp_to_root_org
+from rbac.permissions import RBACPermission
+from terminal.models import default_storage
+from users.models import User
 from .backends import TYPE_ENGINE_MAPPING
-from .models import FTPLog, UserLoginLog, OperateLog, PasswordChangeLog
-from .serializers import FTPLogSerializer, UserLoginLogSerializer, CommandExecutionSerializer
-from .serializers import (
-    OperateLogSerializer, OperateLogActionDetailSerializer,
-    PasswordChangeLogSerializer, CommandExecutionHostsRelationSerializer
+from .const import ActivityChoices
+from .filters import UserSessionFilterSet, OperateLogFilterSet
+from .models import (
+    FTPLog, UserLoginLog, OperateLog, PasswordChangeLog,
+    ActivityLog, JobLog, UserSession
 )
+from .serializers import (
+    FTPLogSerializer, UserLoginLogSerializer, JobLogSerializer,
+    OperateLogSerializer, OperateLogActionDetailSerializer,
+    PasswordChangeLogSerializer, ActivityUnionLogSerializer,
+    FileSerializer, UserSessionSerializer, JobsAuditSerializer
+)
+from .utils import construct_userlogin_usernames
+
+logger = get_logger(__name__)
 
 
-class FTPLogViewSet(CreateModelMixin,
-                    ListModelMixin,
-                    OrgGenericViewSet):
-    model = FTPLog
-    serializer_class = FTPLogSerializer
-    extra_filter_backends = [DatetimeRangeFilter]
+class JobLogAuditViewSet(OrgReadonlyModelViewSet):
+    model = JobLog
+    extra_filter_backends = [DatetimeRangeFilterBackend]
     date_range_filter_fields = [
         ('date_start', ('date_from', 'date_to'))
     ]
-    filterset_fields = ['user', 'asset', 'system_user', 'filename']
-    search_fields = filterset_fields
+    search_fields = ['creator__name', 'material']
+    filterset_fields = ['creator__name', 'material']
+    serializer_class = JobLogSerializer
     ordering = ['-date_start']
 
 
+class JobsAuditViewSet(OrgModelViewSet):
+    model = Job
+    search_fields = ['creator__name']
+    filterset_fields = ['creator__name']
+    serializer_class = JobsAuditSerializer
+    ordering = ['-is_periodic', '-date_updated']
+    http_method_names = ['get', 'options', 'patch']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        queryset = queryset.exclude(type=Types.upload_file).filter(instant=False)
+        return queryset
+
+    def perform_update(self, serializer):
+        job = self.get_object()
+        is_periodic = serializer.validated_data.get('is_periodic')
+        if job.is_periodic != is_periodic:
+            job.is_periodic = is_periodic
+            job.save()
+        name, task, args, kwargs = job.get_register_task()
+        task_obj = PeriodicTask.objects.filter(name=name).first()
+        if task_obj:
+            is_periodic = job.is_periodic
+            if task_obj.enabled != is_periodic:
+                task_obj.enabled = is_periodic
+                task_obj.save()
+        return super().perform_update(serializer)
+
+
+class FTPLogViewSet(OrgModelViewSet):
+    model = FTPLog
+    serializer_class = FTPLogSerializer
+    extra_filter_backends = [DatetimeRangeFilterBackend]
+    date_range_filter_fields = [
+        ('date_start', ('date_from', 'date_to'))
+    ]
+    filterset_fields = ['user', 'asset', 'account', 'filename', 'session']
+    search_fields = filterset_fields
+    ordering = ['-date_start']
+    http_method_names = ['post', 'get', 'head', 'options', 'patch']
+    rbac_perms = {
+        'download': 'audits.view_ftplog',
+    }
+
+    def get_storage(self):
+        return FTPFileStorageHandler(self.get_object())
+
+    @action(
+        methods=[GET], detail=True, permission_classes=[RBACPermission, ],
+        url_path='file/download'
+    )
+    def download(self, request, *args, **kwargs):
+        ftp_log = self.get_object()
+        ftp_storage = self.get_storage()
+        local_path, url = ftp_storage.get_file_path_url()
+        if local_path is None:
+            # url => error message
+            return HttpResponse(url)
+
+        file = open(default_storage.path(local_path), 'rb')
+        response = FileResponse(file)
+        response['Content-Type'] = 'application/octet-stream'
+        filename = escape_uri_path(ftp_log.filename)
+        response["Content-Disposition"] = "attachment; filename*=UTF-8''{}".format(filename)
+        return response
+
+    @action(methods=[POST], detail=True, permission_classes=[IsServiceAccount, ], serializer_class=FileSerializer)
+    def upload(self, request, *args, **kwargs):
+        ftp_log = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        if serializer.is_valid():
+            file = serializer.validated_data['file']
+            name, err = ftp_log.save_file_to_storage(file)
+            if not name:
+                msg = "Failed save file `{}`: {}".format(ftp_log.id, err)
+                logger.error(msg)
+                return Response({'msg': str(err)}, status=400)
+            url = default_storage.url(name)
+            return Response({'url': url}, status=201)
+        else:
+            msg = 'Upload data invalid: {}'.format(serializer.errors)
+            logger.error(msg)
+            return Response({'msg': serializer.errors}, status=401)
+
+
 class UserLoginCommonMixin:
-    queryset = UserLoginLog.objects.all()
+    model = UserLoginLog
     serializer_class = UserLoginLogSerializer
-    extra_filter_backends = [DatetimeRangeFilter]
+    extra_filter_backends = [DatetimeRangeFilterBackend]
     date_range_filter_fields = [
         ('datetime', ('date_from', 'date_to'))
     ]
-    filterset_fields = ['username', 'ip', 'city', 'type', 'status', 'mfa']
-    search_fields = ['username', 'ip', 'city']
+    filterset_fields = ['id', 'username', 'ip', 'city', 'type', 'status', 'mfa']
+    search_fields = ['id', 'username', 'ip', 'city']
 
 
-class UserLoginLogViewSet(UserLoginCommonMixin, ListModelMixin, CommonGenericViewSet):
-
+class UserLoginLogViewSet(UserLoginCommonMixin, OrgReadonlyModelViewSet):
     @staticmethod
-    def get_org_members():
-        users = current_org.get_members().values_list('username', flat=True)
+    def get_org_member_usernames():
+        user_queryset = current_org.get_members()
+        users = construct_userlogin_usernames(user_queryset)
         return users
 
     def get_queryset(self):
         queryset = super().get_queryset()
         if current_org.is_root():
             return queryset
-        users = self.get_org_members()
+        users = self.get_org_member_usernames()
         queryset = queryset.filter(username__in=users)
         return queryset
 
 
-class MyLoginLogAPIView(UserLoginCommonMixin, generics.ListAPIView):
+class MyLoginLogViewSet(UserLoginCommonMixin, OrgReadonlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         qs = super().get_queryset()
-        qs = qs.filter(username=self.request.user.username)
+        username = self.request.user.username
+        q = Q(username=username) | Q(username__icontains=f'({username})')
+        qs = qs.filter(q)
         return qs
 
 
-class OperateLogViewSet(RetrieveModelMixin, ListModelMixin, OrgGenericViewSet):
+class ResourceActivityAPIView(generics.ListAPIView):
+    serializer_class = ActivityUnionLogSerializer
+    ordering_fields = ['datetime']
+    rbac_perms = {
+        'GET': 'audits.view_activitylog',
+    }
+
+    @staticmethod
+    def get_operate_log_qs(fields, limit, org_q, resource_id=None):
+        q, user = Q(resource_id=resource_id), None
+        if is_uuid(resource_id):
+            user = User.objects.filter(id=resource_id).first()
+        if user is not None:
+            q |= Q(user=str(user))
+        queryset = OperateLog.objects.filter(q, org_q).annotate(
+            r_type=Value(ActivityChoices.operate_log, CharField()),
+            r_detail_id=Cast(F('id'), CharField()), r_detail=Value(None, CharField()),
+            r_user=F('user'), r_action=F('action'),
+        ).values(*fields)[:limit]
+        return queryset
+
+    @staticmethod
+    def get_activity_log_qs(fields, limit, org_q, **filters):
+        queryset = ActivityLog.objects.filter(org_q, **filters).annotate(
+            r_type=F('type'), r_detail_id=F('detail_id'),
+            r_detail=F('detail'), r_user=Value(None, CharField()),
+            r_action=Value(None, CharField()),
+        ).values(*fields)[:limit]
+        return queryset
+
+    def get_queryset(self):
+        limit = 30
+        resource_id = self.request.query_params.get('resource_id')
+        fields = (
+            'id', 'datetime', 'r_detail', 'r_detail_id',
+            'r_user', 'r_action', 'r_type'
+        )
+
+        org_q = Q()
+        if not current_org.is_root():
+            org_q = Q(org_id=Organization.SYSTEM_ID) | Q(org_id=current_org.id)
+            if resource_id:
+                org_q |= Q(org_id='') | Q(org_id=Organization.ROOT_ID)
+
+        with tmp_to_root_org():
+            qs1 = self.get_operate_log_qs(fields, limit, org_q, resource_id=resource_id)
+            qs2 = self.get_activity_log_qs(fields, limit, org_q, resource_id=resource_id)
+            queryset = qs2.union(qs1)
+        return queryset.order_by('-datetime')[:limit]
+
+
+class OperateLogViewSet(OrgReadonlyModelViewSet):
     model = OperateLog
     serializer_class = OperateLogSerializer
-    extra_filter_backends = [DatetimeRangeFilter]
+    extra_filter_backends = [DatetimeRangeFilterBackend]
     date_range_filter_fields = [
         ('datetime', ('date_from', 'date_to'))
     ]
-    filterset_fields = ['user', 'action', 'resource_type', 'resource', 'remote_addr']
-    search_fields = ['resource']
+    filterset_class = OperateLogFilterSet
+    search_fields = ['resource', 'user']
     ordering = ['-datetime']
 
+    @lazyproperty
+    def is_action_detail(self):
+        return self.detail and self.request.query_params.get('type') == 'action_detail'
+
     def get_serializer_class(self):
-        if self.request.query_params.get('type') == 'action_detail':
+        if self.is_action_detail:
             return OperateLogActionDetailSerializer
         return super().get_serializer_class()
 
     def get_queryset(self):
         qs = OperateLog.objects.all()
+        if self.is_action_detail:
+            with tmp_to_root_org():
+                qs |= OperateLog.objects.filter(org_id=Organization.SYSTEM_ID)
         es_config = settings.OPERATE_LOG_ELASTICSEARCH_CONFIG
         if es_config:
             engine_mod = import_module(TYPE_ENGINE_MAPPING['es'])
@@ -104,10 +271,10 @@ class OperateLogViewSet(RetrieveModelMixin, ListModelMixin, OrgGenericViewSet):
         return qs
 
 
-class PasswordChangeLogViewSet(ListModelMixin, CommonGenericViewSet):
-    queryset = PasswordChangeLog.objects.all()
+class PasswordChangeLogViewSet(OrgReadonlyModelViewSet):
+    model = PasswordChangeLog
     serializer_class = PasswordChangeLogSerializer
-    extra_filter_backends = [DatetimeRangeFilter]
+    extra_filter_backends = [DatetimeRangeFilterBackend]
     date_range_filter_fields = [
         ('datetime', ('date_from', 'date_to'))
     ]
@@ -116,55 +283,49 @@ class PasswordChangeLogViewSet(ListModelMixin, CommonGenericViewSet):
     ordering = ['-datetime']
 
     def get_queryset(self):
-        users = current_org.get_members()
-        queryset = super().get_queryset().filter(
-            user__in=[user.__str__() for user in users]
-        )
-        return queryset
-
-
-class CommandExecutionViewSet(ListModelMixin, OrgGenericViewSet):
-    model = CommandExecution
-    serializer_class = CommandExecutionSerializer
-    extra_filter_backends = [DatetimeRangeFilter]
-    date_range_filter_fields = [
-        ('date_start', ('date_from', 'date_to'))
-    ]
-    filterset_fields = [
-        'user__name', 'user__username', 'command',
-        'run_as__name', 'run_as__username', 'is_finished'
-    ]
-    search_fields = [
-        'command', 'user__name', 'user__username',
-        'run_as__name', 'run_as__username',
-    ]
-    ordering = ['-date_created']
-
-    def get_queryset(self):
         queryset = super().get_queryset()
-        if current_org.is_root():
-            return queryset
-        queryset = queryset.filter(run_as__org_id=current_org.org_id())
+        if not current_org.is_root():
+            users = current_org.get_members()
+            queryset = queryset.filter(
+                user__in=[str(user) for user in users]
+            )
         return queryset
 
 
-class CommandExecutionHostRelationViewSet(OrgRelationMixin, OrgBulkModelViewSet):
-    serializer_class = CommandExecutionHostsRelationSerializer
-    m2m_field = CommandExecution.hosts.field
-    filterset_class = filters.CommandExecutionFilter
-    search_fields = ('asset__hostname', )
-    http_method_names = ['options', 'get']
+class UserSessionViewSet(CommonApiMixin, viewsets.ModelViewSet):
+    http_method_names = ('get', 'post', 'head', 'options', 'trace')
+    serializer_class = UserSessionSerializer
+    filterset_class = UserSessionFilterSet
+    search_fields = ['id', 'ip', 'city']
     rbac_perms = {
-        'GET': 'ops.view_commandexecution',
-        'list': 'ops.view_commandexecution',
+        'offline': ['audits.offline_usersession']
     }
 
+    @property
+    def org_user_ids(self):
+        user_ids = current_org.get_members().values_list('id', flat=True)
+        return user_ids
+
     def get_queryset(self):
-        queryset = super().get_queryset()
-        queryset = queryset.annotate(
-            asset_display=Concat(
-                F('asset__hostname'), Value('('),
-                F('asset__ip'), Value(')')
-            )
-        )
+        keys = user_session_manager.get_keys()
+        queryset = UserSession.objects.filter(key__in=keys)
+        if current_org.is_root():
+            return queryset
+        user_ids = self.org_user_ids
+        queryset = queryset.filter(user_id__in=user_ids)
         return queryset
+
+    @action(['POST'], detail=False, url_path='offline')
+    def offline(self, request, *args, **kwargs):
+        ids = request.data.get('ids', [])
+        queryset = self.get_queryset()
+        session_key = request.session.session_key
+        queryset = queryset.exclude(key=session_key).filter(id__in=ids)
+        if not queryset.exists():
+            return Response(status=status.HTTP_200_OK)
+
+        keys = queryset.values_list('key', flat=True)
+        for key in keys:
+            user_session_manager.remove(key)
+        queryset.delete()
+        return Response(status=status.HTTP_200_OK)

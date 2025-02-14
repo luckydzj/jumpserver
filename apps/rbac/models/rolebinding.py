@@ -1,11 +1,12 @@
-from django.utils.translation import gettext_lazy as _
-from django.db import models
-from django.db.models import Q
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import Q
+from django.db.models.signals import post_save
+from django.utils.translation import gettext_lazy as _
 from rest_framework.serializers import ValidationError
 
-from common.db.models import JMSModel, CASCADE_SIGNAL_SKIP
+from common.db.models import JMSBaseModel, CASCADE_SIGNAL_SKIP
 from common.utils import lazyproperty
 from orgs.utils import current_org, tmp_to_root_org
 from .role import Role
@@ -15,6 +16,13 @@ __all__ = ['RoleBinding', 'SystemRoleBinding', 'OrgRoleBinding']
 
 
 class RoleBindingManager(models.Manager):
+
+    def bulk_create(self, objs, batch_size=None, ignore_conflicts=False):
+        objs = super().bulk_create(objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts)
+        for i in objs:
+            post_save.send(i.__class__, instance=i, created=True)
+        return objs
+
     def get_queryset(self):
         queryset = super(RoleBindingManager, self).get_queryset()
         q = Q(scope=Scope.system, org__isnull=True)
@@ -30,7 +38,7 @@ class RoleBindingManager(models.Manager):
         return self.get_queryset()
 
 
-class RoleBinding(JMSModel):
+class RoleBinding(JMSBaseModel):
     Scope = Scope
     """ 定义 用户-角色 关系 """
     scope = models.CharField(
@@ -48,6 +56,7 @@ class RoleBinding(JMSModel):
         on_delete=models.CASCADE, verbose_name=_('Organization')
     )
     objects = RoleBindingManager()
+    objects_raw = models.Manager()
 
     class Meta:
         verbose_name = _('Role binding')
@@ -101,6 +110,21 @@ class RoleBinding(JMSModel):
     def is_scope_org(self):
         return self.scope == Scope.org
 
+    @staticmethod
+    def orgs_order_by_name(orgs):
+        from orgs.models import Organization
+        default_system_org_ids = [Organization.DEFAULT_ID, Organization.SYSTEM_ID]
+        default_system_orgs = orgs.filter(id__in=default_system_org_ids)
+        return default_system_orgs | orgs.exclude(id__in=default_system_org_ids).order_by('name')
+
+    @classmethod
+    def get_user_joined_orgs(cls, user):
+        from orgs.models import Organization
+        org_ids = cls.objects.filter(user=user, scope=Scope.org) \
+            .values_list('org', flat=True) \
+            .distinct()
+        return Organization.objects.filter(id__in=org_ids)
+
     @classmethod
     def get_user_has_the_perm_orgs(cls, perm, user):
         from orgs.models import Organization
@@ -126,15 +150,18 @@ class RoleBinding(JMSModel):
             org_ids = [b.org.id for b in bindings if b.org]
             orgs = all_orgs.filter(id__in=org_ids)
 
+        orgs = cls.orgs_order_by_name(orgs)
         workbench_perm = 'rbac.view_workbench'
         # 全局组织
+        has_root_org = False
+        root_org = Organization.root()
         if orgs and perm != workbench_perm and user.has_perm('orgs.view_rootorg'):
-            root_org = Organization.root()
-            orgs = [root_org, *list(orgs)]
+            has_root_org = True
         elif orgs and perm == workbench_perm and user.has_perm('orgs.view_alljoinedorg'):
-            # Todo: 先复用组织
-            root_org = Organization.root()
-            root_org.name = _("All organizations")
+            root_org.name = _('All organizations')
+            has_root_org = True
+
+        if has_root_org and system_bindings:
             orgs = [root_org, *list(orgs)]
         return orgs
 
@@ -175,7 +202,7 @@ class OrgRoleBinding(RoleBinding):
 
 class SystemRoleBindingManager(RoleBindingManager):
     def get_queryset(self):
-        queryset = super(RoleBindingManager, self).get_queryset()\
+        queryset = super(RoleBindingManager, self).get_queryset() \
             .filter(scope=Scope.system)
         return queryset
 

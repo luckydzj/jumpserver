@@ -9,7 +9,7 @@ class RBACBackend(JMSBaseAuthBackend):
     def is_enabled():
         return True
 
-    def authenticate(self, *args, **kwargs):
+    def authenticate(self):
         return None
 
     def username_allow_authenticate(self, username):
@@ -20,7 +20,12 @@ class RBACBackend(JMSBaseAuthBackend):
             raise PermissionDenied()
         if perm == '*':
             return True
-        perm_set = set(i.strip() for i in perm.split('|'))
+        if isinstance(perm, str):
+            perm_set = set(i.strip() for i in perm.split('|'))
+        elif isinstance(perm, (list, tuple, set)):
+            perm_set = set(perm)
+        else:
+            raise ValueError('perm must be str, list, tuple or set')
         has_perm = bool(perm_set & set(user_obj.perms))
         if not has_perm:
             raise PermissionDenied()

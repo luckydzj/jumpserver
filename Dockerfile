@@ -1,105 +1,68 @@
-FROM python:3.8-slim as stage-build
-ARG TARGETARCH
+FROM jumpserver/core-base:20241210_070105 AS stage-build
 
 ARG VERSION
-ENV VERSION=$VERSION
 
 WORKDIR /opt/jumpserver
+
 ADD . .
-RUN cd utils && bash -ixeu build.sh
 
-FROM python:3.8-slim
-ARG TARGETARCH
-MAINTAINER JumpServer Team <ibuler@qq.com>
+RUN echo > /opt/jumpserver/config.yml \
+    && \
+    if [ -n "${VERSION}" ]; then \
+        sed -i "s@VERSION = .*@VERSION = '${VERSION}'@g" apps/jumpserver/const.py; \
+    fi
 
-ARG BUILD_DEPENDENCIES="              \
-        g++                           \
-        make                          \
-        pkg-config"
+RUN set -ex \
+    && export SECRET_KEY=$(head -c100 < /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 48) \
+    && . /opt/py3/bin/activate \
+    && cd apps \
+    && python manage.py compilemessages
+
+
+FROM python:3.11-slim-bullseye
+ENV LANG=en_US.UTF-8 \
+    PATH=/opt/py3/bin:$PATH
 
 ARG DEPENDENCIES="                    \
-        default-libmysqlclient-dev    \
-        freetds-dev                   \
-        libpq-dev                     \
-        libffi-dev                    \
-        libjpeg-dev                   \
         libldap2-dev                  \
-        libsasl2-dev                  \
-        libxml2-dev                   \
-        libxmlsec1-dev                \
-        libxmlsec1-openssl            \
-        libaio-dev                    \
-        openssh-client                \
-        sshpass"
+        libx11-dev"
 
 ARG TOOLS="                           \
+        cron                          \
         ca-certificates               \
-        curl                          \
-        default-mysql-client          \
-        iputils-ping                  \
-        locales                       \
-        procps                        \
-        redis-tools                   \
-        telnet                        \
-        vim                           \
-        unzip                         \
-        wget"
+        default-libmysqlclient-dev    \
+        openssh-client                \
+        sshpass                       \
+        bubblewrap"
 
-ARG APT_MIRROR=http://mirrors.ustc.edu.cn
+ARG APT_MIRROR=http://deb.debian.org
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=core \
-    sed -i "s@http://.*.debian.org@${APT_MIRROR}@g" /etc/apt/sources.list \
-    && rm -f /etc/apt/apt.conf.d/docker-clean \
+RUN set -ex \
+    && sed -i "s@http://.*.debian.org@${APT_MIRROR}@g" /etc/apt/sources.list \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
-    && apt-get update \
-    && apt-get -y install --no-install-recommends ${BUILD_DEPENDENCIES} \
+    && apt-get update > /dev/null \
     && apt-get -y install --no-install-recommends ${DEPENDENCIES} \
     && apt-get -y install --no-install-recommends ${TOOLS} \
     && mkdir -p /root/.ssh/ \
-    && echo "Host *\n\tStrictHostKeyChecking no\n\tUserKnownHostsFile /dev/null" > /root/.ssh/config \
-    && echo "set mouse-=a" > ~/.vimrc \
+    && echo "Host *\n\tStrictHostKeyChecking no\n\tUserKnownHostsFile /dev/null\n\tCiphers +aes128-cbc\n\tKexAlgorithms +diffie-hellman-group1-sha1\n\tHostKeyAlgorithms +ssh-rsa" > /root/.ssh/config \
     && echo "no" | dpkg-reconfigure dash \
-    && echo "zh_CN.UTF-8" | dpkg-reconfigure locales \
-    && sed -i "s@# export @export @g" ~/.bashrc \
-    && sed -i "s@# alias @alias @g" ~/.bashrc \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean all \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "0 3 * * * root find /tmp -type f -mtime +1 -size +1M -exec rm -f {} \; && date > /tmp/clean.log" > /etc/cron.d/cleanup_tmp \
+    && chmod 0644 /etc/cron.d/cleanup_tmp
 
-ARG DOWNLOAD_URL=https://download.jumpserver.org
-
-RUN mkdir -p /opt/oracle/ \
-    && cd /opt/oracle/ \
-    && wget ${DOWNLOAD_URL}/public/instantclient-basiclite-linux.${TARGETARCH}-19.10.0.0.0.zip \
-    && unzip instantclient-basiclite-linux.${TARGETARCH}-19.10.0.0.0.zip \
-    && sh -c "echo /opt/oracle/instantclient_19_10 > /etc/ld.so.conf.d/oracle-instantclient.conf" \
-    && ldconfig \
-    && rm -f instantclient-basiclite-linux.${TARGETARCH}-19.10.0.0.0.zip
-
-WORKDIR /tmp/build
-COPY ./requirements ./requirements
-
-ARG PIP_MIRROR=https://pypi.douban.com/simple
-ENV PIP_MIRROR=$PIP_MIRROR
-ARG PIP_JMS_MIRROR=https://pypi.douban.com/simple
-ENV PIP_JMS_MIRROR=$PIP_JMS_MIRROR
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    set -ex \
-    && pip config set global.index-url ${PIP_MIRROR} \
-    && pip install --upgrade pip \
-    && pip install --upgrade setuptools wheel \
-    && pip install $(grep -E 'jms|jumpserver' requirements/requirements.txt) -i ${PIP_JMS_MIRROR} \
-    && pip install -r requirements/requirements.txt
-
-COPY --from=stage-build /opt/jumpserver/release/jumpserver /opt/jumpserver
-RUN echo > /opt/jumpserver/config.yml \
-    && rm -rf /tmp/build
+COPY --from=stage-build /opt /opt
+COPY --from=stage-build /usr/local/bin /usr/local/bin
+COPY --from=stage-build /opt/jumpserver/apps/libs/ansible/ansible.cfg /etc/ansible/
 
 WORKDIR /opt/jumpserver
+
 VOLUME /opt/jumpserver/data
-VOLUME /opt/jumpserver/logs
-
-ENV LANG=zh_CN.UTF-8
-
-EXPOSE 8070 8080
 
 ENTRYPOINT ["./entrypoint.sh"]
+
+EXPOSE 8080
+
+STOPSIGNAL SIGQUIT
+
+CMD ["start", "all"]
